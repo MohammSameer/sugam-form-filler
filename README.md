@@ -8,6 +8,8 @@ blocks prompt-injection.
 Built on **Google ADK** (multi-agent) + **Gemini 2.5 Flash** (vision) + an **MCP server** for
 domain tools.
 
+**Author:** [MohammSameer](https://github.com/MohammSameer)
+
 ## Prerequisites
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv)
