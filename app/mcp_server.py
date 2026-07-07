@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import datetime
 
@@ -8,6 +9,15 @@ import datetime
 # handler deadlocks the stdio JSON-RPC transport on Windows (the C-extension
 # import races the asyncio stdout reader), which surfaced as a 30s tool timeout.
 from fpdf import FPDF
+
+# Shared helpers. This server runs as a standalone stdio subprocess (launched by
+# file path), so we import the sibling modules directly rather than
+# `from app.pdf_filler import ...` — the latter would run app/__init__ and pull
+# in the whole agent stack. Both modules keep heavy libs lazy / are stdlib-only,
+# so these imports stay light and do not risk the stdio deadlock noted above.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pdf_filler  # noqa: E402
+import knowledge_base as kb  # noqa: E402  (shared, self-populating scheme/form catalog)
 
 from mcp.server import Server, NotificationOptions
 from mcp.server.stdio import stdio_server
@@ -22,106 +32,11 @@ server = Server("sugam-mcp-server")
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ARTIFACTS_DIR = os.path.join(_PROJECT_ROOT, "artifacts")
 
-# Fonts that support Indic / Unicode scripts, tried in order. Falls back to a
-# built-in Latin font if none are present.
-_UNICODE_FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\Nirmala.ttc",   # Windows 11: Nirmala UI *collection* — covers Devanagari, Tamil, Telugu, etc.
-    r"C:\Windows\Fonts\Nirmala.ttf",   # older Windows layout (single-file variant)
-    r"C:\Windows\Fonts\mangal.ttf",    # Devanagari
-    r"C:\Windows\Fonts\ARIALUNI.TTF",  # Arial Unicode MS
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
-
-# --------------------------------------------------------------------------- #
-# Real reference data (offline knowledge base) for named forms & schemes.
-# --------------------------------------------------------------------------- #
-FORM_CATALOG = {
-    "KYC": [
-        ("Full Name", "Your name exactly as printed on your official ID."),
-        ("Father's / Spouse's Name", "Name of your father or spouse."),
-        ("Date of Birth", "Your birth date in DD/MM/YYYY format."),
-        ("Gender", "Male, Female, or Other."),
-        ("PAN Number", "Your 10-character Permanent Account Number."),
-        ("Aadhaar Number", "Your 12-digit Aadhaar number."),
-        ("Address", "Your full residential address with PIN code."),
-        ("Mobile Number", "An active 10-digit mobile number."),
-        ("Email ID", "A valid email address (optional)."),
-    ],
-    "PAN": [
-        ("Full Name", "Applicant's full name as it should appear on the PAN card."),
-        ("Father's Name", "Father's full name (mandatory even for married women)."),
-        ("Date of Birth", "Date of birth in DD/MM/YYYY."),
-        ("Aadhaar Number", "12-digit Aadhaar for e-KYC."),
-        ("Address", "Residential or office address."),
-        ("Source of Income", "Salary, business, or other income source."),
-    ],
-    "AADHAAR": [
-        ("Full Name", "Resident's name in English and local language."),
-        ("Date of Birth", "Verified or declared date of birth."),
-        ("Gender", "Male, Female, or Transgender."),
-        ("Address", "Current residential address with proof."),
-        ("Mobile Number", "For OTP-based verification."),
-        ("Biometrics", "Fingerprints and iris scan captured at the centre."),
-    ],
-}
-
-SCHEME_CATALOG = {
-    "PM-KISAN": {
-        "full_name": "Pradhan Mantri Kisan Samman Nidhi",
-        "benefit": "Rs. 6,000 per year paid in three equal instalments to eligible farmer families.",
-        "eligibility": "Small and marginal farmer families owning cultivable land.",
-        "documents": "Aadhaar, land records, and bank account details.",
-    },
-    "AYUSHMAN BHARAT": {
-        "full_name": "Ayushman Bharat - Pradhan Mantri Jan Arogya Yojana (PMJAY)",
-        "benefit": "Health cover of up to Rs. 5 lakh per family per year for secondary and tertiary care.",
-        "eligibility": "Families identified as deprived under the SECC 2011 database.",
-        "documents": "Aadhaar and ration card / SECC verification.",
-    },
-    "PMAY": {
-        "full_name": "Pradhan Mantri Awas Yojana",
-        "benefit": "Financial assistance / interest subsidy to build or buy a house.",
-        "eligibility": "EWS, LIG and MIG households without a pucca house.",
-        "documents": "Aadhaar, income certificate, and bank details.",
-    },
-    "UJJWALA": {
-        "full_name": "Pradhan Mantri Ujjwala Yojana",
-        "benefit": "Free LPG connection with financial support to below-poverty-line households.",
-        "eligibility": "Adult women from BPL households without an existing LPG connection.",
-        "documents": "Aadhaar, BPL ration card, and bank account details.",
-    },
-    "SUKANYA SAMRIDDHI": {
-        "full_name": "Sukanya Samriddhi Yojana",
-        "benefit": "High-interest small savings account for a girl child with tax benefits.",
-        "eligibility": "Girl child below 10 years of age; account opened by parent/guardian.",
-        "documents": "Girl's birth certificate, guardian's ID and address proof.",
-    },
-}
-
-
-def _normalise(key: str) -> str:
-    return re.sub(r"[\s_\-]+", " ", key.strip().upper())
-
-
-# Normalised lookup tables so "pm kisan", "PM-KISAN", "pm_kisan" all match.
-_FORM_LOOKUP = {_normalise(k): v for k, v in FORM_CATALOG.items()}
-_SCHEME_LOOKUP = {_normalise(k): v for k, v in SCHEME_CATALOG.items()}
-
-# Common alternate names / synonyms for schemes.
-_SCHEME_ALIASES = {
-    "PMJAY": "AYUSHMAN BHARAT",
-    "AYUSHMAN": "AYUSHMAN BHARAT",
-    "AYUSHMAN BHARAT PMJAY": "AYUSHMAN BHARAT",
-    "PM KISAN SAMMAN NIDHI": "PM-KISAN",
-    "KISAN": "PM-KISAN",
-    "PM AWAS YOJANA": "PMAY",
-    "AWAS": "PMAY",
-    "SUKANYA": "SUKANYA SAMRIDDHI",
-    "SUKANYA SAMRIDDHI YOJANA": "SUKANYA SAMRIDDHI",
-    "UJJWALA YOJANA": "UJJWALA",
-    "LPG": "UJJWALA",
-}
-
+# Named-form field lists and government-scheme details now live in the shared
+# `knowledge_base` module, which backs every lookup with a curated seed catalog
+# PLUS a self-populating JSON store the agent's grounded-research tools write to.
+# So a scheme/form missing from the seed is no longer a dead-end: once it has
+# been researched once, these tools find it here on every subsequent call.
 
 # --------------------------------------------------------------------------- #
 # Tool declarations
@@ -177,18 +92,8 @@ def _build_pdf(form_id: str, data: dict) -> str:
     pdf.add_page()
 
     # Register a Unicode font when available so native-language values render.
-    font = "helvetica"
-    unicode_ok = False
-    for path in _UNICODE_FONT_CANDIDATES:
-        if os.path.exists(path):
-            try:
-                pdf.add_font("uni", "", path)
-                pdf.add_font("uni", "B", path)
-                font = "uni"
-                unicode_ok = True
-                break
-            except Exception:
-                continue
+    unicode_ok = pdf_filler.register_unicode_font(pdf)
+    font = "uni" if unicode_ok else "helvetica"
 
     def text(value: str) -> str:
         # If we only have a Latin font, drop characters it cannot encode.
@@ -226,35 +131,39 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
 
     if name == "parse_form_fields":
         form_id = arguments.get("form_id", "")
-        fields = _FORM_LOOKUP.get(_normalise(form_id))
+        fields = kb.lookup_form(form_id)
         if not fields:
-            known = ", ".join(sorted(FORM_CATALOG))
+            known = ", ".join(kb.known_form_names())
             return [TextContent(
                 type="text",
-                text=(f"I don't have a stored template for '{form_id}'. "
-                      f"Known forms: {known}. If you have the form, please upload it and I will read it directly."),
+                text=(f"NOT_FOUND: I don't have a stored template for '{form_id}'. "
+                      f"Known forms: {known}. Best option: ask the user to upload the form so "
+                      f"'form_reader' can read it directly. If they only have the name, call "
+                      f"'research_form_fields' to look its required fields up from official sources."),
             )]
         lines = "\n".join(f"{i}. {label} - {desc}" for i, (label, desc) in enumerate(fields, 1))
         return [TextContent(type="text", text=f"Required fields for {form_id.upper()}:\n{lines}")]
 
     if name == "lookup_govt_scheme":
         scheme_name = arguments.get("scheme_name", "")
-        key = _normalise(scheme_name)
-        key = _SCHEME_ALIASES.get(key, key)
-        scheme = _SCHEME_LOOKUP.get(key)
+        scheme = kb.lookup_scheme(scheme_name)
         if not scheme:
-            known = ", ".join(sorted(SCHEME_CATALOG))
+            known = ", ".join(kb.known_scheme_names())
             return [TextContent(
                 type="text",
-                text=f"I don't have details for '{scheme_name}'. Known schemes: {known}.",
+                text=(f"NOT_FOUND: I don't have curated details for '{scheme_name}'. "
+                      f"Known schemes: {known}. Call 'research_govt_scheme' to fetch it from "
+                      f"official web sources — it will remember the result for next time."),
             )]
-        return [TextContent(
-            type="text",
-            text=(f"{scheme['full_name']}\n"
-                  f"- Benefit: {scheme['benefit']}\n"
-                  f"- Eligibility: {scheme['eligibility']}\n"
-                  f"- Documents needed: {scheme['documents']}"),
-        )]
+        lines = [
+            scheme["full_name"],
+            f"- Benefit: {scheme['benefit']}",
+            f"- Eligibility: {scheme['eligibility']}",
+            f"- Documents needed: {scheme['documents']}",
+        ]
+        if scheme.get("origin") == "grounded" and scheme.get("sources"):
+            lines.append("- Sources: " + ", ".join(scheme["sources"]))
+        return [TextContent(type="text", text="\n".join(lines))]
 
     if name == "generate_filled_pdf":
         form_id = arguments.get("form_id", "form")

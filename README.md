@@ -41,6 +41,11 @@ uv run adk web app --host 127.0.0.1 --port 18081
   enforcement, and JSON audit logging.
 - **Real MCP tools** — `parse_form_fields`, `lookup_govt_scheme`, and `generate_filled_pdf`
   (writes an actual PDF to `artifacts/`).
+- **Self-healing knowledge base** — when a scheme or form is *not* in the curated catalog, the
+  agent doesn't dead-end: `research_govt_scheme` / `research_form_fields` look it up live via
+  **Gemini + Google Search grounding**, cite the official sources, and persist the verified
+  result to `artifacts/kb/*.json` so it's an instant, offline cache hit next time (shared with
+  the MCP subprocess). The hardcoded catalog is a fast cache, never a limit.
 - **Human-in-the-loop** — the agent asks for one field at a time and waits for you, instead of
   dumping 20 fields at once.
 
@@ -111,10 +116,15 @@ runs before every LLM call regardless of which agent is active.
 
 ## What is real vs. representative
 - **Real**: vision document reading, multilingual conversation, multi-agent delegation, PII
-  masking, injection/consent blocking, audit logging, the three MCP tools, and PDF generation.
-- **Representative**: `parse_form_fields` / `lookup_govt_scheme` use a curated **offline**
-  knowledge base (not a live government API). `generate_filled_pdf` produces a clean labelled
-  data sheet of the collected fields (not a pixel-perfect overlay of the original form layout).
+  masking, injection/consent blocking, audit logging, the three MCP tools, PDF generation, and
+  the grounded self-healing knowledge base (`research_govt_scheme` / `research_form_fields`).
+- **Curated + grounded**: `parse_form_fields` / `lookup_govt_scheme` answer known schemes/forms
+  from a curated **offline** seed catalog; anything missing is fetched live via Google Search
+  grounding, cited, and cached to `artifacts/kb/`. So coverage is effectively unbounded — the
+  seed is just the trusted fast path.
+- **Representative**: `generate_filled_pdf` produces a clean labelled data sheet of the collected
+  fields (not a pixel-perfect overlay). For an exact fill of a specific form, upload it and the
+  `fill_uploaded_pdf` path writes onto the original.
 
 ## Assets
 - Cover banner: `assets/cover_page_banner.png`
