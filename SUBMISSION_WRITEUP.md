@@ -26,7 +26,15 @@ graph TD
     MCP --> T1[parse_form_fields]
     MCP --> T2[lookup_govt_scheme]
     MCP --> T3[generate_filled_pdf]
+
+    T1 -- "unknown form/scheme" --> KB[Google Search grounding<br/>cite + cache to artifacts/kb]
+    T2 -- "unknown form/scheme" --> KB
+
+    Orch --> FM[FallbackGemini<br/>quota failover]
 ```
+
+A purpose-built web UI (`frontend/` + `app/server.py`) sits in front of this, serving the
+SPA and ADK's own agent API from one process on one port.
 
 ## Concepts Used
 - **ADK LlmAgent + sub-agents**: A root `orchestrator` coordinates two specialists — `form_reader`
@@ -65,7 +73,9 @@ in `app/agent.py`:
 3. **Consent Enforcement** — a domain rule that blocks the flow if the user explicitly refuses
    consent.
 4. **Audit Logging** — every decision is logged as JSON to `artifacts/audit.log` and streamed to
-   the terminal, so redactions and blocks are visible live during a demo.
+   the terminal, so redactions and blocks are visible live during a demo. The same events are
+   mirrored onto an in-memory bus (`app/security_events.py`) that the web UI polls, so the user
+   — not just the developer watching a console — can see the checkpoint working.
 
 ## MCP Server Design
 `app/mcp_server.py` exposes three working tools:
@@ -75,6 +85,32 @@ in `app/agent.py`:
   (PM-KISAN, Ayushman Bharat, PMAY, Ujjwala, Sukanya Samriddhi), with fuzzy name matching.
 - `generate_filled_pdf` — generates an actual PDF (via `fpdf2`) from the collected data and saves it
   to `artifacts/`, with Unicode-font support so native-language values render.
+
+### Self-healing knowledge base
+A curated catalog that dead-ends on anything unlisted would make the demo brittle and the
+product useless. So the catalog is a **fast cache, never a limit**: when a scheme or form is
+missing, `research_govt_scheme` / `research_form_fields` look it up live via **Gemini + Google
+Search grounding**, cite the official sources, and persist the verified result to
+`artifacts/kb/*.json` — shared with the MCP subprocess, so it is an instant offline hit next
+time. Coverage is effectively unbounded; the seed is just the trusted fast path.
+
+### Filling the user's actual form
+`fill_uploaded_pdf` writes answers onto the uploaded document, choosing a placement strategy
+per form: AcroForm fields → comb/box grids → text-layer label anchors → **Tesseract OCR label
+anchors** → **Gemini vision bounding boxes**. The first four cost no vision call at all. Two
+decisions carry the accuracy:
+- The OCR-vs-vision choice is made **locally**, by fuzzy-matching collected field names against
+  OCR labels — so a noisy phone photo skips straight to vision with nothing wasted.
+- The vision model returns a **position, never the text** (`{index, box_2d}`); the answer is
+  looked up from our own collected data. Asked to echo the value, it wrote the field *label*
+  into the blank instead of the answer — returning only a position removes that failure mode.
+
+### Staying alive on free-tier quota
+One completed form is many model requests. `app/fallback_model.py` wraps the single model
+object all three agents share, so a spent daily quota (429) or an unavailable model name (404)
+fails over to the next model in the chain instead of stranding the user mid-form. Every switch
+is audited as a `model_failover` event, so the degradation is visible to an operator without
+ever being pushed at the user.
 
 ## Vision + Multilingual Flow
 - **Vision**: When the user uploads a form, the orchestrator transfers to `form_reader`, whose
@@ -87,20 +123,48 @@ in `app/agent.py`:
 than requesting twenty fields at once — a genuine step-by-step HITL experience. When collection is
 complete it transfers back to the orchestrator to generate the PDF.
 
+## The Sugam Web App
+The ADK dev UI is an event inspector for developers; the people this product serves are on a
+cheap phone, in bright sunlight, and may read slowly or not at all. `frontend/` (React 19 +
+Vite + Tailwind v4, ~151 KB gzipped) is built for them, and `app/server.py` serves it from the
+same process as the agent — it calls ADK's own `get_fast_api_app(web=False)`, so sessions,
+`/run_sse` streaming and artifact storage are ADK's, not a reimplementation. One process, one
+port, no Node in production.
+
+What it adds that the dev UI structurally cannot:
+- **Language first** — ten languages, each shown in its own script; picking one opens the
+  conversation in that language. Urdu renders right-to-left.
+- **Voice in and out** — speak your answer, and press Listen to hear a reply. Speech output is
+  hybrid by necessity: Chrome ships voices for only a few of the ten languages, and reading
+  Tamil with an English voice is gibberish, so the client falls back to server-side Gemini TTS
+  (`/api/tts`, LRU-cached) only for languages with no real on-device voice.
+- **A live Trust panel** — PII masking happens in a `before_model_callback`, *before* the model
+  call, and a blocked prompt short-circuits the call entirely, so neither ever appears in the
+  agent's event stream. `app/security_events.py` mirrors them onto an in-memory bus so the
+  person being protected can watch the protection happen.
+- **The filled form, visible inline** — a server-rendered PNG preview in the conversation, with
+  Download beside it. No separate artifacts panel to find.
+
 ## Demo Walkthrough
 1. **Upload + native language** — user uploads a KYC form and asks in Hindi; `form_reader` reads it
    with vision and explains the fields in Hindi.
 2. **Conversational collection** — `data_collector` gathers details one field at a time.
 3. **PII masking** — an Aadhaar number in the input is redacted before the LLM sees it.
 4. **Injection/consent block** — a bypass/refusal attempt is stopped with a Security Policy Violation.
-5. **Real PDF** — `generate_filled_pdf` writes a downloadable PDF to `artifacts/`.
+5. **Real PDF** — `fill_uploaded_pdf` writes the answers onto the user's own form (or
+   `generate_filled_pdf` produces a labelled data sheet), and it appears inline with a preview.
 
 ## What is Real vs. Representative
 - **Real**: vision reading, multilingual conversation, multi-agent delegation, PII masking,
-  injection/consent blocking, audit logging, the three MCP tools, and PDF generation.
-- **Representative**: the form/scheme catalogs are a curated **offline** knowledge base (not a live
-  government API); the generated PDF is a clean labelled data sheet of collected fields (not a
-  pixel-perfect overlay of the original form layout).
+  injection/consent blocking, audit logging, the three MCP tools, PDF generation, filling the
+  user's own uploaded form, cross-model quota failover, and the grounded self-healing knowledge
+  base.
+- **Curated + grounded**: the form/scheme catalogs are a curated **offline** seed (not a live
+  government API), but anything missing is fetched live via Google Search grounding, cited, and
+  cached — so coverage is not capped by the seed.
+- **Representative**: `generate_filled_pdf` is a clean labelled data sheet of collected fields,
+  not a pixel-perfect overlay. Placement onto a low-quality *photo* of a form is best-effort,
+  which is exactly why the UI shows the filled result for the user to check before submitting.
 
 ## Impact / Value Statement
 Sugam turns an intimidating bureaucratic wall into a short conversation in the user's own language,

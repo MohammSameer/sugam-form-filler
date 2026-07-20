@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+/**
+ * Sugam design tokens.
+ *
+ * Tuned for the actual user: someone on a cheap phone, in bright sunlight, who
+ * may read slowly or not at all. That drives three non-negotiables —
+ *   1. Large base type (18px, not the usual 16) and generous line-height.
+ *   2. Every interactive target >= 56px tall (WCAG 2.5.5 asks 44; a thumb on a
+ *      bus wants more).
+ *   3. Text/background contrast at or above WCAG AA everywhere, including the
+ *      muted text, which is where most designs quietly fail.
+ *
+ * The palette is warm indigo (trust, officialdom) with a saffron accent for the
+ * single most important action on any screen. Never more than one saffron
+ * element in view: it means "press this".
+ */
+
+@theme {
+  --color-ink: oklch(0.21 0.03 265);
+  --color-ink-soft: oklch(0.44 0.02 265);
+
+  --color-canvas: oklch(0.98 0.005 265);
+  --color-surface: oklch(1 0 0);
+  --color-surface-sunk: oklch(0.955 0.008 265);
+
+  --color-line: oklch(0.9 0.01 265);
+
+  --color-brand: oklch(0.45 0.16 275);
+  --color-brand-soft: oklch(0.95 0.03 275);
+  --color-brand-ink: oklch(0.35 0.16 275);
+
+  --color-accent: oklch(0.71 0.17 55);
+  --color-accent-ink: oklch(0.42 0.13 55);
+  --color-accent-soft: oklch(0.96 0.04 65);
+
+  --color-safe: oklch(0.6 0.13 155);
+  --color-safe-soft: oklch(0.95 0.04 155);
+  --color-safe-ink: oklch(0.42 0.1 155);
+
+  --color-danger: oklch(0.58 0.2 25);
+  --color-danger-soft: oklch(0.96 0.03 25);
+  --color-danger-ink: oklch(0.45 0.18 25);
+
+  --text-base: 1.125rem; /* 18px floor */
+  --text-base--line-height: 1.6;
+
+  --radius-xl2: 1.25rem;
+
+  --animate-shimmer: shimmer 1.8s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@layer base {
+  html {
+    /* Never below 18px, but honour the user's own browser zoom / font scaling. */
+    font-size: 112.5%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-canvas text-ink antialiased;
+    font-family:
+      "Noto Sans", "Noto Sans Devanagari", "Noto Sans Tamil", "Noto Sans Bengali",
+      "Noto Sans Telugu", "Noto Sans Kannada", "Noto Sans Gujarati",
+      "Noto Sans Gurmukhi", "Noto Nastaliq Urdu", system-ui, -apple-system,
+      "Segoe UI", sans-serif;
+    /* Indic scripts have tall ascenders/descenders that clip at tight leading. */
+    line-height: 1.65;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* A visible, high-contrast focus ring — many of these users navigate by
+     keyboard or switch device, and the default ring is far too subtle. */
+  :focus-visible {
+    @apply outline-brand outline-2 outline-offset-2;
+  }
+
+  /* Respect the OS "reduce motion" setting; vestibular triggers are real. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* The minimum comfortable target. Applied to every button and input. */
+  .tap {
+    min-height: 3.5rem; /* 56px */
+  }
+
+  .scroll-shadow {
+    background:
+      linear-gradient(var(--color-canvas) 30%, transparent) top / 100% 1.5rem
+        no-repeat,
+      linear-gradient(transparent, var(--color-canvas) 70%) bottom / 100% 1.5rem
+        no-repeat;
+    background-attachment: local, local;
+  }
+}

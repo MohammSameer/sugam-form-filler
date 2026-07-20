@@ -350,13 +350,153 @@ def boxes_to_char_placements(row: dict, value: str, size: float = 9.0) -> list[d
     return out
 
 
-def render_pages_to_pngs(pdf_bytes: bytes, dpi: int = 150) -> list[bytes]:
-    """Render each page to a PNG (bytes) for vision-based coordinate mapping."""
+def _tesseract_cmd() -> str | None:
+    """Locate the tesseract binary: env override, else the standard Windows path."""
+    env = os.getenv("TESSERACT_CMD")
+    if env and os.path.exists(env):
+        return env
+    default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    return default if os.path.exists(default) else None  # else assume it's on PATH
+
+
+def ocr_line_anchors(pdf_bytes: bytes, dpi: int = 300, min_conf: int = 35) -> list[dict]:
+    """OCR a scanned/image form and return label anchors — the accurate path.
+
+    For a form with no text layer (a photo or scan), this is far better than
+    asking a vision model for pixel coordinates: Tesseract reports the exact
+    bounding box of every printed word, so we know precisely where each label
+    sits and can place its value right after it.
+
+    A form line often carries several fields ("Sub Division …… Block: …… Village:").
+    We drop the dotted-leader / punctuation tokens, then split the remaining real
+    words into separate labels wherever a wide horizontal GAP appears (the blank
+    that would be written in). Each anchor is {"index", "page", "label", "x", "y",
+    "size"} with (x, y) in PDF points from the TOP-LEFT — the same shape
+    extract_line_anchors returns — so it feeds the identical downstream matcher.
+
+    Returns [] if Tesseract is unavailable or finds no text, so the caller falls
+    back to the vision path without error.
+    """
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return []
+
+    cmd = _tesseract_cmd()
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    anchors: list[dict] = []
+    try:
+        zoom = dpi / 72.0
+        for pno, page in enumerate(doc):
+            pw, ph = page.rect.width, page.rect.height  # PDF points
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            try:
+                data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            except Exception:
+                return []  # tesseract binary missing/broken → let caller use vision
+            sx, sy = pw / pix.width, ph / pix.height  # px → points
+
+            # Group recognised words into text lines.
+            lines: dict[tuple, list] = {}
+            for i in range(len(data["text"])):
+                txt = (data["text"][i] or "").strip()
+                try:
+                    conf = int(float(data["conf"][i]))
+                except (ValueError, TypeError):
+                    conf = -1
+                # Keep only confident tokens that contain a letter — this drops the
+                # dotted leaders and stray punctuation, so the gaps between real
+                # labels reappear for splitting.
+                if not txt or conf < min_conf or not any(c.isalpha() for c in txt):
+                    continue
+                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                lines.setdefault(key, []).append(
+                    {
+                        "t": txt,
+                        "x0": data["left"][i],
+                        "y0": data["top"][i],
+                        "x1": data["left"][i] + data["width"][i],
+                        "y1": data["top"][i] + data["height"][i],
+                    }
+                )
+
+            for ws in lines.values():
+                ws.sort(key=lambda w: w["x0"])
+                line_h = max(w["y1"] - w["y0"] for w in ws) or 10.0
+                baseline = max(w["y1"] for w in ws)
+                # Split into label groups at gaps wider than ~1.2 line-heights.
+                groups = [[ws[0]]]
+                for prev, cur in zip(ws, ws[1:]):
+                    if (cur["x0"] - prev["x1"]) > 1.2 * line_h:
+                        groups.append([cur])
+                    else:
+                        groups[-1].append(cur)
+
+                for g in groups:
+                    label = " ".join(w["t"] for w in g).strip()
+                    if len(label) < 2:
+                        continue
+                    x_after = (max(w["x1"] for w in g) + 6) * sx  # just past the label
+                    anchors.append(
+                        {
+                            "index": len(anchors),
+                            "page": pno,
+                            "label": label,
+                            "x": float(x_after),
+                            "y": float(baseline * sy),
+                            "size": float(max(8.0, min(line_h * sy * 0.85, 13.0))),
+                        }
+                    )
+    finally:
+        doc.close()
+    return anchors
+
+
+def render_pages_to_pngs(pdf_bytes: bytes, max_edge: int = 1400) -> list[bytes]:
+    """Render each page to a PNG (bytes), long edge capped at `max_edge` pixels.
+
+    Capping the size matters for the vision path: a smaller image uploads faster
+    and Gemini tiles it into fewer patches, so a full-page coordinate call is
+    quicker and cheaper without losing the detail needed to place a value. The
+    previous fixed 150-DPI render produced needlessly large images (a real cost on
+    the free tier's latency).
+    """
     import fitz
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        return [page.get_pixmap(dpi=dpi).tobytes("png") for page in doc]
+        out: list[bytes] = []
+        for page in doc:
+            longest = max(page.rect.width, page.rect.height) or 1.0
+            zoom = min(max_edge / longest, 2.0)  # never upscale past 2x
+            mat = fitz.Matrix(zoom, zoom)
+            out.append(page.get_pixmap(matrix=mat).tobytes("png"))
+        return out
+    finally:
+        doc.close()
+
+
+def render_preview_png(pdf_bytes: bytes, page: int = 0, max_edge: int = 1000) -> bytes:
+    """Render one page of a (filled) PDF to a PNG for an in-app preview.
+
+    The web UI shows this as a plain <img>, which every browser renders reliably —
+    unlike a PDF blob in an <iframe>, which is blank in many Chromium builds. Reuses
+    the fitz renderer already present; adds no dependency.
+    """
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        p = doc[max(0, min(page, doc.page_count - 1))]
+        longest = max(p.rect.width, p.rect.height) or 1.0
+        zoom = min(max_edge / longest, 2.0)
+        return p.get_pixmap(matrix=fitz.Matrix(zoom, zoom)).tobytes("png")
     finally:
         doc.close()
 
@@ -378,7 +518,14 @@ def overlay_values(pdf_bytes: bytes, placements: list[dict]) -> bytes:
     # Build a transparent overlay document, one page per original page, same size.
     overlay = FPDF(unit="pt")
     overlay.set_auto_page_break(False)
-    unicode_ok = register_unicode_font(overlay)
+
+    # Register the (large) Unicode font ONLY when a value actually needs a
+    # non-Latin script. An all-English form then uses the built-in helvetica: no
+    # multi-MB font embedded, no "MERG NOT subset" merge warning, a smaller file
+    # and a faster merge. Indic values still render because we load the font when
+    # any value contains non-ASCII.
+    needs_unicode = any(not str(p.get("value", "")).isascii() for p in placements)
+    unicode_ok = register_unicode_font(overlay) if needs_unicode else False
     font = "uni" if unicode_ok else "helvetica"
 
     def encode(value: str) -> str:
