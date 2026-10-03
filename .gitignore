@@ -19,8 +19,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root: these are Python build output. Unanchored, `lib/`
+# also swallows frontend/src/lib/, which every component imports.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -206,6 +208,8 @@ tools/a2a-inspector/
 # Extra ignores from Phase 1
 *.env
 .env.*
+# ...but the key-less template MUST be committed — the README tells you to copy it.
+!.env.example
 *.pyo
 *.pyd
 *.db

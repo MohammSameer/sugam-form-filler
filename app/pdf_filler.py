@@ -1,0 +1,567 @@
+"""Fill the user's *own* uploaded PDF/image — instead of generating a new one.
+
+Two strategies, decided at runtime:
+
+1. AcroForm path — the upload already has interactive form fields. We set their
+   values directly with `pypdf` (reliable, pixel-perfect, no coordinates needed).
+2. Overlay path — the upload is a flat / scanned form with no fields. We draw the
+   collected values on top of the original page at absolute coordinates (supplied
+   by the caller, typically from Gemini vision) using `fpdf2`, then merge that
+   transparent layer back onto the original with `pypdf`.
+
+This module is intentionally free of ADK / LLM / network imports so it stays pure
+and unit-testable. Heavy PDF libraries (`pypdf`, `fitz`) are imported lazily inside
+the functions that need them, so importing this module stays cheap — important
+because the MCP stdio server (`mcp_server.py`) imports the font helper at load time
+and a heavy C-extension import there can deadlock the stdio JSON-RPC transport.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+
+# Fonts that support Indic / Unicode scripts, tried in order. Falls back to a
+# built-in Latin font if none are present. Shared with mcp_server.py so the
+# data-sheet fallback and the overlay path render native scripts identically.
+UNICODE_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\Nirmala.ttc",   # Windows 11: Nirmala UI collection — Devanagari, Tamil, Telugu, etc.
+    r"C:\Windows\Fonts\Nirmala.ttf",   # older Windows layout (single-file variant)
+    r"C:\Windows\Fonts\mangal.ttf",    # Devanagari
+    r"C:\Windows\Fonts\ARIALUNI.TTF",  # Arial Unicode MS
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+
+
+def register_unicode_font(pdf) -> bool:
+    """Register the first available Unicode font on an FPDF instance as "uni".
+
+    Returns True if a Unicode font was registered (so native-language values will
+    render), False if we must fall back to the built-in Latin font "helvetica".
+    """
+    for path in UNICODE_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                pdf.add_font("uni", "", path)
+                pdf.add_font("uni", "B", path)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Input normalisation
+# --------------------------------------------------------------------------- #
+def image_to_pdf_bytes(image_bytes: bytes) -> bytes:
+    """Wrap a raw image into a single-page PDF so it can be overlaid.
+
+    PyMuPDF sniffs PNG/JPEG straight from the byte stream, but cannot always
+    detect other raster formats (WebP in particular) with no filetype hint, so we
+    fall back to Pillow — which decodes webp/tiff/bmp/gif reliably — and re-encode
+    to PNG before handing the bytes back to fitz. This keeps the fast native path
+    for the common cases while accepting any format Pillow can open.
+    """
+    import fitz  # PyMuPDF — lazy import (heavy C-extension)
+
+    try:
+        doc = fitz.open(stream=image_bytes, filetype=None)  # infer type from bytes
+    except Exception:
+        # fitz could not detect the format — normalise via Pillow to PNG bytes.
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="PNG")
+        doc = fitz.open(stream=buf.getvalue(), filetype="png")
+
+    try:
+        return doc.convert_to_pdf()
+    finally:
+        doc.close()
+
+
+# --------------------------------------------------------------------------- #
+# AcroForm (interactive fields) path
+# --------------------------------------------------------------------------- #
+def has_acroform_fields(pdf_bytes: bytes) -> bool:
+    """True if the PDF has interactive AcroForm fields we can fill directly."""
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        fields = reader.get_fields()
+    except Exception:
+        return False
+    return bool(fields)
+
+
+def list_acroform_fields(pdf_bytes: bytes) -> list[str]:
+    """Return the fully-qualified names of every AcroForm field in the PDF."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    fields = reader.get_fields() or {}
+    return list(fields.keys())
+
+
+def fill_acroform(pdf_bytes: bytes, mapping: dict[str, str]) -> bytes:
+    """Set AcroForm field values and return the filled PDF as bytes.
+
+    `mapping` is {field_name: value}. Unknown field names are ignored by pypdf.
+    NeedAppearances is enabled so viewers regenerate the visible text.
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    writer.append(reader)
+
+    # Only pass string values; drop blanks so we never clobber a field with "".
+    clean = {k: str(v) for k, v in mapping.items() if v not in (None, "")}
+    for page in writer.pages:
+        try:
+            writer.update_page_form_field_values(page, clean, auto_regenerate=False)
+        except Exception:
+            # A page without widgets raises in some pypdf versions — skip it.
+            continue
+
+    try:
+        writer.set_need_appearances_writer(True)
+    except Exception:
+        pass
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Overlay (flat / scanned) path
+# --------------------------------------------------------------------------- #
+def page_sizes(pdf_bytes: bytes) -> list[tuple[float, float]]:
+    """Return (width, height) in PDF points for every page."""
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return [(p.rect.width, p.rect.height) for p in doc]
+    finally:
+        doc.close()
+
+
+def extract_line_anchors(pdf_bytes: bytes) -> list[dict]:
+    """Deterministically locate each blank/underline and the label before it.
+
+    For a *text-based* (not scanned) form this is far more reliable than asking a
+    vision model for coordinates: we read the real geometry. Crucially, anchors
+    are at BLANK-RUN granularity, not line granularity — a single dense line like
+    "Tel.: ___ Mobile No.: ___ Fax: ___ Email id: ___" yields four separate
+    anchors, each labelled by the words immediately before its blank, so multiple
+    fields on one line never collide.
+
+    Each anchor is {"index", "page", "label", "x", "y"} where (x, y) is the point
+    — in PDF points from the TOP-LEFT — at which the value should be written (the
+    start of the blank, on that line's baseline). Returns [] for pages with no
+    extractable text (scanned images), signalling the vision fallback is needed.
+    """
+    import re
+
+    import fitz
+
+    blank_re = re.compile(r"^[_\.․‥…]{2,}$")  # underscore / dot-leader runs
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    anchors: list[dict] = []
+    try:
+        for pno, page in enumerate(doc):
+            # words: (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+            words = page.get_text("words")
+            lines: dict[tuple, list] = {}
+            for w in words:
+                lines.setdefault((w[5], w[6]), []).append(w)
+
+            for _key, ws in lines.items():
+                ws.sort(key=lambda t: t[0])
+                y = max(t[3] for t in ws) - 1  # baseline ≈ bottom of the line box
+                label_buf: list[str] = []
+                prev_blank = False
+                emitted = False
+                for t in ws:
+                    word = t[4]
+                    if blank_re.match(word):
+                        if not prev_blank:  # first blank of a run → one anchor
+                            label = " ".join(label_buf[-8:]).strip()
+                            if label:
+                                anchors.append(
+                                    {
+                                        "index": len(anchors),
+                                        "page": pno,
+                                        "label": label,
+                                        "x": float(t[0]),
+                                        "y": float(y),
+                                    }
+                                )
+                                emitted = True
+                            label_buf = []  # label belongs only to this blank
+                        prev_blank = True
+                    else:
+                        label_buf.append(word)
+                        prev_blank = False
+
+                # Line with a label but no visible underline (e.g. "Label:" then
+                # empty space) — place just after the label so it still fills.
+                if not emitted:
+                    label = " ".join(label_buf).strip()
+                    if label.endswith(":") and len(label) > 1:
+                        anchors.append(
+                            {
+                                "index": len(anchors),
+                                "page": pno,
+                                "label": label,
+                                "x": float(max(t[2] for t in ws) + 4),
+                                "y": float(y),
+                            }
+                        )
+    finally:
+        doc.close()
+    return anchors
+
+
+def _split_comb_groups(cells: list[tuple]) -> list[list[tuple]]:
+    """Split a row of x-sorted cells into separate comb fields at large gaps."""
+    if not cells:
+        return []
+    cell_w = cells[0][2] - cells[0][0]
+    groups = [[cells[0]]]
+    for prev, cur in zip(cells, cells[1:]):
+        # A gap wider than ~2.8 cells means a new field (not a within-field space).
+        if (cur[0] - prev[0]) > 2.8 * max(cell_w, 1):
+            groups.append([cur])
+        else:
+            groups[-1].append(cur)
+    return groups
+
+
+def _label_for_cells(words: list, cells: list[tuple]) -> str:
+    """Best-guess label for a comb field: text to its left, else the line above."""
+    x0 = cells[0][0]
+    y_top = min(c[1] for c in cells)
+    y_bot = max(c[3] for c in cells)
+    y_mid = (y_top + y_bot) / 2
+
+    # Prefer words on the same row, to the left of the first cell.
+    left = [w for w in words if w[2] <= x0 + 2 and y_top - 3 <= (w[1] + w[3]) / 2 <= y_bot + 3]
+    if left:
+        left.sort(key=lambda w: w[0])
+        return " ".join(w[4] for w in left[-8:]).strip()
+
+    # Otherwise the nearest text line directly above the field.
+    above = [w for w in words if w[3] <= y_mid and cells[0][0] - 40 <= w[0] <= cells[-1][2] + 40]
+    if above:
+        above.sort(key=lambda w: w[3])
+        band_bottom = above[-1][3]
+        band = [w for w in above if band_bottom - w[3] <= 6]
+        band.sort(key=lambda w: w[0])
+        return " ".join(w[4] for w in band[-8:]).strip()
+    return ""
+
+
+def extract_box_rows(pdf_bytes: bytes, min_cells: int = 4) -> list[dict]:
+    """Detect comb/box grids (one character per cell) drawn as vector rectangles.
+
+    Government KYC forms often use a row of small equal squares instead of an
+    underline. Each returned row is {"index", "page", "label", "cells"} where
+    cells is the ordered list of (x0, y0, x1, y1) cell rectangles in PDF points
+    from the top-left, so a value can be written one character per box.
+    """
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    rows_out: list[dict] = []
+    try:
+        for pno, page in enumerate(doc):
+            seen: set = set()
+            cells: list[tuple] = []
+            for d in page.get_drawings():
+                for item in d["items"]:
+                    if item[0] != "re":
+                        continue
+                    r = item[1]
+                    w, h = r.width, r.height
+                    if 8 <= w <= 16 and 8 <= h <= 22:  # comb-cell size range
+                        key = (round(r.x0), round(r.y0))
+                        if key not in seen:
+                            seen.add(key)
+                            cells.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
+            if not cells:
+                continue
+
+            # Group cells into rows by y (tolerance ~3pt), then split each row
+            # into distinct comb fields at large horizontal gaps.
+            rows: dict[int, list] = {}
+            for c in cells:
+                rows.setdefault(round(c[1] / 3), []).append(c)
+
+            words = page.get_text("words")
+            for _yk, cs in rows.items():
+                cs.sort(key=lambda c: c[0])
+                for group in _split_comb_groups(cs):
+                    if len(group) < min_cells:
+                        continue
+                    rows_out.append(
+                        {
+                            "index": len(rows_out),
+                            "page": pno,
+                            "label": _label_for_cells(words, group),
+                            "cells": group,
+                        }
+                    )
+    finally:
+        doc.close()
+    return rows_out
+
+
+def boxes_to_char_placements(row: dict, value: str, size: float = 9.0) -> list[dict]:
+    """Expand a value into one-character-per-cell placements for a comb row.
+
+    Block-letter forms expect uppercase; a space in the value advances one cell
+    (leaving it blank) to mirror word separators. Returns standard overlay
+    placements ({"page", "x", "y", "value", "size"}) with each character centred
+    in its cell.
+    """
+    cells = row["cells"]
+    page = row["page"]
+    out: list[dict] = []
+    ci = 0
+    for ch in str(value).upper():
+        if ci >= len(cells):
+            break
+        if ch == " ":
+            ci += 1
+            continue
+        x0, y0, x1, y1 = cells[ci]
+        char_w = 0.6 * size
+        cx = x0 + max(0.0, (x1 - x0 - char_w) / 2)
+        baseline = y1 - max(2.0, (y1 - y0) * 0.2)
+        out.append({"page": page, "x": cx, "y": baseline, "value": ch, "size": size})
+        ci += 1
+    return out
+
+
+def _tesseract_cmd() -> str | None:
+    """Locate the tesseract binary: env override, else the standard Windows path."""
+    env = os.getenv("TESSERACT_CMD")
+    if env and os.path.exists(env):
+        return env
+    default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    return default if os.path.exists(default) else None  # else assume it's on PATH
+
+
+def ocr_line_anchors(pdf_bytes: bytes, dpi: int = 300, min_conf: int = 35) -> list[dict]:
+    """OCR a scanned/image form and return label anchors — the accurate path.
+
+    For a form with no text layer (a photo or scan), this is far better than
+    asking a vision model for pixel coordinates: Tesseract reports the exact
+    bounding box of every printed word, so we know precisely where each label
+    sits and can place its value right after it.
+
+    A form line often carries several fields ("Sub Division …… Block: …… Village:").
+    We drop the dotted-leader / punctuation tokens, then split the remaining real
+    words into separate labels wherever a wide horizontal GAP appears (the blank
+    that would be written in). Each anchor is {"index", "page", "label", "x", "y",
+    "size"} with (x, y) in PDF points from the TOP-LEFT — the same shape
+    extract_line_anchors returns — so it feeds the identical downstream matcher.
+
+    Returns [] if Tesseract is unavailable or finds no text, so the caller falls
+    back to the vision path without error.
+    """
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return []
+
+    cmd = _tesseract_cmd()
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    anchors: list[dict] = []
+    try:
+        zoom = dpi / 72.0
+        for pno, page in enumerate(doc):
+            pw, ph = page.rect.width, page.rect.height  # PDF points
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            try:
+                data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            except Exception:
+                return []  # tesseract binary missing/broken → let caller use vision
+            sx, sy = pw / pix.width, ph / pix.height  # px → points
+
+            # Group recognised words into text lines.
+            lines: dict[tuple, list] = {}
+            for i in range(len(data["text"])):
+                txt = (data["text"][i] or "").strip()
+                try:
+                    conf = int(float(data["conf"][i]))
+                except (ValueError, TypeError):
+                    conf = -1
+                # Keep only confident tokens that contain a letter — this drops the
+                # dotted leaders and stray punctuation, so the gaps between real
+                # labels reappear for splitting.
+                if not txt or conf < min_conf or not any(c.isalpha() for c in txt):
+                    continue
+                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                lines.setdefault(key, []).append(
+                    {
+                        "t": txt,
+                        "x0": data["left"][i],
+                        "y0": data["top"][i],
+                        "x1": data["left"][i] + data["width"][i],
+                        "y1": data["top"][i] + data["height"][i],
+                    }
+                )
+
+            for ws in lines.values():
+                ws.sort(key=lambda w: w["x0"])
+                line_h = max(w["y1"] - w["y0"] for w in ws) or 10.0
+                baseline = max(w["y1"] for w in ws)
+                # Split into label groups at gaps wider than ~1.2 line-heights.
+                groups = [[ws[0]]]
+                for prev, cur in zip(ws, ws[1:]):
+                    if (cur["x0"] - prev["x1"]) > 1.2 * line_h:
+                        groups.append([cur])
+                    else:
+                        groups[-1].append(cur)
+
+                for g in groups:
+                    label = " ".join(w["t"] for w in g).strip()
+                    if len(label) < 2:
+                        continue
+                    x_after = (max(w["x1"] for w in g) + 6) * sx  # just past the label
+                    anchors.append(
+                        {
+                            "index": len(anchors),
+                            "page": pno,
+                            "label": label,
+                            "x": float(x_after),
+                            "y": float(baseline * sy),
+                            "size": float(max(8.0, min(line_h * sy * 0.85, 13.0))),
+                        }
+                    )
+    finally:
+        doc.close()
+    return anchors
+
+
+def render_pages_to_pngs(pdf_bytes: bytes, max_edge: int = 1400) -> list[bytes]:
+    """Render each page to a PNG (bytes), long edge capped at `max_edge` pixels.
+
+    Capping the size matters for the vision path: a smaller image uploads faster
+    and Gemini tiles it into fewer patches, so a full-page coordinate call is
+    quicker and cheaper without losing the detail needed to place a value. The
+    previous fixed 150-DPI render produced needlessly large images (a real cost on
+    the free tier's latency).
+    """
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        out: list[bytes] = []
+        for page in doc:
+            longest = max(page.rect.width, page.rect.height) or 1.0
+            zoom = min(max_edge / longest, 2.0)  # never upscale past 2x
+            mat = fitz.Matrix(zoom, zoom)
+            out.append(page.get_pixmap(matrix=mat).tobytes("png"))
+        return out
+    finally:
+        doc.close()
+
+
+def render_preview_png(pdf_bytes: bytes, page: int = 0, max_edge: int = 1000) -> bytes:
+    """Render one page of a (filled) PDF to a PNG for an in-app preview.
+
+    The web UI shows this as a plain <img>, which every browser renders reliably —
+    unlike a PDF blob in an <iframe>, which is blank in many Chromium builds. Reuses
+    the fitz renderer already present; adds no dependency.
+    """
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        p = doc[max(0, min(page, doc.page_count - 1))]
+        longest = max(p.rect.width, p.rect.height) or 1.0
+        zoom = min(max_edge / longest, 2.0)
+        return p.get_pixmap(matrix=fitz.Matrix(zoom, zoom)).tobytes("png")
+    finally:
+        doc.close()
+
+
+def overlay_values(pdf_bytes: bytes, placements: list[dict]) -> bytes:
+    """Draw values onto the original PDF at absolute coordinates and return bytes.
+
+    Each placement is {"page": int, "x": float, "y": float, "value": str} where
+    x/y are in PDF points measured from the TOP-LEFT of the page (matching the
+    convention Gemini vision returns), and page is a 0-based index.
+    """
+    from fpdf import FPDF
+    from pypdf import PdfReader, PdfWriter
+
+    sizes = page_sizes(pdf_bytes)
+    if not sizes:
+        return pdf_bytes
+
+    # Build a transparent overlay document, one page per original page, same size.
+    overlay = FPDF(unit="pt")
+    overlay.set_auto_page_break(False)
+
+    # Register the (large) Unicode font ONLY when a value actually needs a
+    # non-Latin script. An all-English form then uses the built-in helvetica: no
+    # multi-MB font embedded, no "MERG NOT subset" merge warning, a smaller file
+    # and a faster merge. Indic values still render because we load the font when
+    # any value contains non-ASCII.
+    needs_unicode = any(not str(p.get("value", "")).isascii() for p in placements)
+    unicode_ok = register_unicode_font(overlay) if needs_unicode else False
+    font = "uni" if unicode_ok else "helvetica"
+
+    def encode(value: str) -> str:
+        if unicode_ok:
+            return value
+        return value.encode("latin-1", "replace").decode("latin-1")
+
+    by_page: dict[int, list[dict]] = {}
+    for p in placements:
+        by_page.setdefault(int(p.get("page", 0)), []).append(p)
+
+    for idx, (w, h) in enumerate(sizes):
+        overlay.add_page(format=(w, h))
+        overlay.set_text_color(0, 0, 0)
+        for p in by_page.get(idx, []):
+            value = str(p.get("value", "")).strip()
+            if not value:
+                continue
+            x = max(0.0, min(float(p.get("x", 0)), w))
+            y = max(0.0, min(float(p.get("y", 0)), h))
+            overlay.set_font(font, "", float(p.get("size", 11)))
+            # FPDF.text places the baseline at (x, y) from the top-left — same
+            # origin the caller uses — so the merged layers line up.
+            overlay.text(x, y, encode(value))
+
+    overlay_bytes = bytes(overlay.output())
+
+    # Merge the overlay onto the original, page by page. Clone the original into
+    # the writer first so pages are writer-attached before merge (pypdf's
+    # reliable path — merging detached reader pages is deprecated/unreliable).
+    writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
+    over = PdfReader(io.BytesIO(overlay_bytes))
+    for i, page in enumerate(writer.pages):
+        if i < len(over.pages):
+            page.merge_page(over.pages[i])
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
